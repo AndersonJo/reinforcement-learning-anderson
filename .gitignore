@@ -1,0 +1,9 @@
+# Project
+.ipynb_checkpoints
+.idea
+
+# python
+*.pyc
+
+
+
