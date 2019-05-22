@@ -96,8 +96,7 @@ class REINFORCE(object):
         action = np.random.choice(range(action_probs.shape[1]), p=action_probs.ravel())
         return action
 
-    def train(self, n_epochs=10, batch_episodes=1, gamma=0.99, episode_step_increment: int = 100,
-              limit_episode_step: int = 10000):
+    def train(self, n_epochs=10, batch_episodes=1, gamma=0.99):
         env = self.env
         best_reward = 0
 
