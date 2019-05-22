@@ -16,8 +16,8 @@ from keras.utils import plot_model
 
 def get_args():
     parser = ArgumentParser()
-    parser.add_argument('--checkpoint', default=None)
     parser.add_argument('mode', default='train', type=str)
+    parser.add_argument('--checkpoint', default=None)
     parser.set_defaults(mode='train', checkpoint=None)
     args = parser.parse_args()
     return args
@@ -96,7 +96,8 @@ class REINFORCE(object):
         action = np.random.choice(range(action_probs.shape[1]), p=action_probs.ravel())
         return action
 
-    def train(self, n_epochs=10, batch_episodes=1, gamma=0.99):
+    def train(self, n_epochs=10, batch_episodes=1, gamma=0.99, episode_step_increment: int = 100,
+              limit_episode_step: int = 10000):
         env = self.env
         best_reward = 0
 
@@ -129,6 +130,16 @@ class REINFORCE(object):
             _sum_qval = round(float(np.sum(q_values)) / batch_episodes, 2)
             _sum_reward = round(float(np.sum(self.buffer_rewards)) / batch_episodes, 2)
 
+            # Increase Maximum Episode Steps
+            # _episode_step_increased = False
+            # if env._max_episode_steps < limit_episode_step and _sum_reward >= env._max_episode_steps - 1:
+            #     env._max_episode_steps += episode_step_increment
+            #     if env._max_episode_steps > limit_episode_step:
+            #         env._max_episode_steps = limit_episode_step
+            #     _episode_step_increased = True
+            if epoch > 2000:
+                env._max_episode_steps = epoch
+
             # Save Model
             is_saved = False
             if best_reward <= _sum_reward:
@@ -138,10 +149,10 @@ class REINFORCE(object):
 
             # Visualization
             print(f'[{epoch}] score: {_score:6} | q-values: {_sum_qval:8} | reward: {_sum_reward:6} | '
-                  f'save:{is_saved:<3}')
+                  f'save:{is_saved}')
             self.clear()
 
-    def play(self, n=10):
+    def play(self, n=100):
         env = self.env
         env._max_episode_steps = 10000
 
@@ -181,7 +192,7 @@ def main():
     args = get_args()
 
     env = gym.make("CartPole-v0")
-    env._max_episode_steps = 1000
+
     env.reset()
     print('mode             :', args.mode)
     print('observation space:', env.observation_space.shape)
@@ -198,12 +209,12 @@ def main():
     plot_model(model, 'reinforce.png', show_shapes=True)
 
     reinforce = REINFORCE(env, model)
-    if args.mode == 'play' and os.path.exists(args.checkpoint):
+    if args.mode == 'play':
         print('MODE: PLAY!')
         reinforce.play()
     elif args.mode == 'train':
         print('MODE: TRAIN!')
-        reinforce.train(n_epochs=300, batch_episodes=2)
+        reinforce.train(n_epochs=5000, batch_episodes=2)
 
 
 if __name__ == '__main__':
