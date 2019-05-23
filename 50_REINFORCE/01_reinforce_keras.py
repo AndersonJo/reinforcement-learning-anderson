@@ -154,6 +154,7 @@ class REINFORCE(object):
     def play(self, n=100):
         env = self.env
         env._max_episode_steps = 10000
+        env.env.theta_threshold_radians = np.pi
 
         for epoch in range(n):
             current_state = env.reset()
@@ -191,7 +192,6 @@ def main():
     args = get_args()
 
     env = gym.make("CartPole-v0")
-
     env.reset()
     print('mode             :', args.mode)
     print('observation space:', env.observation_space.shape)
