@@ -129,13 +129,6 @@ class REINFORCE(object):
             _sum_qval = round(float(np.sum(q_values)) / batch_episodes, 2)
             _sum_reward = round(float(np.sum(self.buffer_rewards)) / batch_episodes, 2)
 
-            # Increase Maximum Episode Steps
-            # _episode_step_increased = False
-            # if env._max_episode_steps < limit_episode_step and _sum_reward >= env._max_episode_steps - 1:
-            #     env._max_episode_steps += episode_step_increment
-            #     if env._max_episode_steps > limit_episode_step:
-            #         env._max_episode_steps = limit_episode_step
-            #     _episode_step_increased = True
             if epoch > 2000:
                 env._max_episode_steps = epoch
 
