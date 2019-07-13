@@ -4,7 +4,9 @@
 
 # python
 *.pyc
+venv
 
 
 # Data
 checkpoints
+
