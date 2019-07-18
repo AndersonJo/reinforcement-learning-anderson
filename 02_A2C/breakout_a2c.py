@@ -1,17 +1,13 @@
-from abc import abstractmethod
 from collections import deque
 from multiprocessing.connection import Connection
 from typing import List, Tuple, Callable
 
 import cv2
 import gym
-import gym_super_mario_bros
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from gym_super_mario_bros.actions import SIMPLE_MOVEMENT
-from nes_py.wrappers import JoypadSpace
 from torch import optim
 from torch.distributions import Categorical
 from torch.multiprocessing import Process, Pipe
@@ -31,17 +27,17 @@ class A2CModel(nn.Module):
                       out_channels=32,
                       kernel_size=8,
                       stride=4),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Conv2d(in_channels=32,
                       out_channels=64,
                       kernel_size=4,
                       stride=2),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Conv2d(in_channels=64,
                       out_channels=64,
                       kernel_size=3,
                       stride=1),
-            nn.ReLU())
+            nn.LeakyReLU())
         conv_output_size = self._calculate_output_size(input_shape, n_history)
 
         # Flatten
@@ -97,9 +93,13 @@ class MultiProcessEnv(Process):
         self.input_size = input_size
         self.render = render
 
+        # BreakOut Specific Variables
+        self.lives = env.env.ale.lives()
+
         # Game State Variables
         self.step = 0
         self._reward = 0
+        self._reward_dq = deque(maxlen=100)
 
         # Set Replay Memory
         self.n_history = n_history
@@ -122,27 +122,32 @@ class MultiProcessEnv(Process):
                 env.render()
 
             next_state, reward, done, info = env.step(action)
-            done = self.is_done(info)
+            die = self.is_done(info)
+            if die:
+                reward -= 1
 
             self.memory_state(next_state)
             self.step += 1
             self._reward += reward
 
             # Send information to Parent Processor
-            self.child_conn.send([self.history, reward, done, info])
+            self.child_conn.send([self.history, reward, done or die, info])
 
             # Check
             # if info['life'] <= 0:
             #     done = True
 
             if done:
+                self._reward_dq.append(self._reward)
                 episode += 1
-                print(f'[{self.process_idx}] episode:{episode} | step:{self.step} | reward: {self._reward}')
+                print(f'[{self.process_idx}] episode:{episode} | step:{self.step} | reward: {self._reward} | '
+                      f'reward mean:{np.mean(self._reward_dq)}')
                 self.reset()
 
     def is_done(self, info):
         if 'ale.lives' in info:
-            if info['ale.lives'] <= 0:
+            if info['ale.lives'] < self.lives or info['ale.lives'] <= 0:
+                self.lives = info['ale.lives']
                 return True
         return False
 
@@ -158,12 +163,13 @@ class MultiProcessEnv(Process):
         h = cv2.cvtColor(state, cv2.COLOR_RGB2GRAY)
         h = cv2.resize(h, (self.input_size[1], self.input_size[0]))
         h = np.float32(h) / 255
-        # h = h[:, :, 0] * 0.299 + h[:, :, 1] * 0.587 + h[:, :, 2] * 0.114
         return h
 
     def reset(self):
+        self.env.reset()
         self.step = 0
         self._reward = 0
+        self.lives = self.env.env.ale.lives()
 
         # Initialize Replay Memory
         init_state = self.env.reset()
@@ -173,7 +179,7 @@ class MultiProcessEnv(Process):
 
 class Agent(object):
 
-    def __init__(self, model: nn.Module, n_action: int, learning_rate=0.0002, cuda: bool = False):
+    def __init__(self, model: nn.Module, n_action: int, learning_rate=0.0002, cuda: bool = True):
         self.device: str = 'cuda' if cuda else 'cpu'
         self.n_action = n_action
         self.model = model.to(self.device)
@@ -190,11 +196,9 @@ class Agent(object):
         states = torch.from_numpy(states).float().to(self.device)
         policy, value = self.model(states)
         softmax_policy = F.softmax(policy, dim=-1)
-
         actions = softmax_policy.multinomial(1).view(-1).cpu().numpy()  # 가중치에 따라서 action을 선택
-        actions += 1
-        print(actions)
-        # action = np.random.choice(self.n_action, size=1, p=policy)
+        # policy = F.softmax(policy, dim=-1).data.cpu().numpy()
+        # actions = self.random_choice_prob_index(policy)
         return actions
 
     def predict_transition(self, states: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -209,34 +213,29 @@ class Agent(object):
         pred_values = pred_values.view(-1).data.cpu().numpy()
         return pred_policies, pred_values
 
-    def train(self, actions, states, next_states, discounted_returns, advantages, entropy_coef=0.02):
+    def train(self, actions, states, next_states, critic_y, actor_y, entropy_coef=0.02):
         with torch.no_grad():  # It makes tensors set "requires_grad" to be false
-            state_batch = torch.FloatTensor(states).to(self.device)
-            next_state_batch = torch.FloatTensor(next_states).to(self.device)
-            target_batch = torch.FloatTensor(discounted_returns).to(self.device)
-            advantage_batch = torch.FloatTensor(advantages).to(self.device)
-            y_batch = torch.LongTensor(actions).to(self.device)
+            states = torch.FloatTensor(states).to(self.device)
+            next_states = torch.FloatTensor(next_states).to(self.device)
+            actions = torch.LongTensor(actions).to(self.device)
+            critic_y = torch.FloatTensor(critic_y).to(self.device)
+            actor_y = torch.FloatTensor(actor_y).to(self.device)
 
-        # Standardization
-        advantage_batch = (advantage_batch - advantage_batch.mean()) / (advantage_batch.std() + 1e-18)
-
-        pred_policy, pred_value = self.model(state_batch)
-        policy_softmax = F.softmax(pred_policy, dim=-1)
-        m = Categorical(policy_softmax)
+        pred_policy, pred_value = self.model(states)
+        m = Categorical(F.softmax(pred_policy, dim=-1))
 
         # Actor loss
-        actor_loss = -m.log_prob(y_batch) * advantage_batch
+        actor_loss = -m.log_prob(actions) * actor_y
 
         # Entorpy
         entropy = m.entropy()
 
         # Critic loss
-        critic_loss = self.mse(pred_value.sum(1), target_batch)
-
-        self.optimizer.zero_grad()
+        critic_loss = self.mse(pred_value.sum(1), critic_y)
 
         # Loss
-        loss = actor_loss.mean() * 0.5 * critic_loss - entropy_coef * entropy.mean()
+        loss = actor_loss.mean() + 0.5 * critic_loss - entropy_coef * entropy.mean()
+        self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
         self.optimizer.step()
@@ -269,7 +268,7 @@ class A2CTrain(object):
 
         # Initialize Agent
         self.agent: A2CAgent = A2CAgent(model, n_action=n_action, cuda=cuda)
-        self.agent.model.load_state_dict(torch.load('checkpoints/mario.model'))
+        # self.agent.model.load_state_dict(torch.load('checkpoints/mario.model'))
 
         # Initialize Environments
         self.envs: List[MultiProcessEnv] = []
@@ -334,17 +333,17 @@ class A2CTrain(object):
                 self._store_data(states, actions, next_states, rewards, dones, infos)
 
                 # Update states <- next_states
-                states = next_states
+                states = next_states[:, :, :, :]
 
             # Train Policy and Value Networks
             target_data = self._build_target_data(gamma=gamma, lambda_=lambda_)
-            group_states, group_next_states, group_discounted_returns, group_actions, group_advantages = target_data
+            group_states, group_next_states, group_actions, group_critic_y, group_actor_y = target_data
 
             self.agent.train(group_actions,
                              group_states,
                              group_next_states,
-                             group_discounted_returns,
-                             group_advantages)
+                             group_critic_y,
+                             group_actor_y)
 
             if step % 500 == 0:
                 print(f'saved | actions:{group_actions}')
@@ -413,29 +412,28 @@ class A2CTrain(object):
         _, pred_next_values = self.agent.predict_transition(group_next_states)
 
         # Build Target
-        group_discounted_returns = []
-        group_advantages = []
+        group_critic_y = []
+        group_actor_y = []
         for idx in range(self.n_processor):
             _rewards = group_rewards[idx * self.n_step: (idx + 1) * self.n_step]
             _pred_values = pred_values[idx * self.n_step: (idx + 1) * self.n_step]
             _pred_next_values = pred_next_values[idx * self.n_step: (idx + 1) * self.n_step]
             _dones = group_dones[idx * self.n_step: (idx + 1) * self.n_step]
 
-            discounted_return, advantage = self.calculate_td_lambda(_rewards, _pred_values, _pred_next_values,
-                                                                    _dones, gamma=gamma, lambda_=lambda_)
+            critic_y, actor_y = self._build_targets(_rewards, _pred_values, _pred_next_values,
+                                                    _dones, gamma=gamma, lambda_=lambda_)
 
-            group_discounted_returns.append(discounted_return)
-            group_advantages.append(advantage)
+            group_critic_y.append(critic_y)
+            group_actor_y.append(actor_y)
 
-        group_discounted_returns = np.hstack(group_discounted_returns)
-        group_advantages = np.hstack(group_advantages)
+        group_critic_y = np.hstack(group_critic_y)
+        group_actor_y = np.hstack(group_actor_y)
 
-        return group_states, group_next_states, group_discounted_returns, group_actions, group_advantages
+        return group_states, group_next_states, group_actions, group_critic_y, group_actor_y
 
-    def calculate_td_lambda(self, rewards: np.ndarray, pred_values: np.ndarray, pred_next_values: np.ndarray,
-                            dones: np.ndarray, gamma: float, lambda_: float) -> Tuple[np.ndarray, np.ndarray]:
+    def _build_targets(self, rewards: np.ndarray, pred_values: np.ndarray, pred_next_values: np.ndarray,
+                       dones: np.ndarray, gamma: float, lambda_: float) -> Tuple[np.ndarray, np.ndarray]:
         """
-        TD(\lambda)
 
         It receives environment data of a single processor
         :param rewards: an array of the n-step rewards r_t from a single processor
@@ -443,20 +441,15 @@ class A2CTrain(object):
         :param pred_next_values: an array of the n-step V(s_{t+1}) from a single processor
         :param dones:
         """
-        discounted_return = np.zeros((self.n_step))
-
-        z = 0
+        critic_y = np.zeros(self.n_step)  # discounted rewards
+        # _next_value = pred_next_values[-1]
         for t in range(self.n_step - 1, -1, -1):
             # 1-step TD: V(s_t) r_t + \gamma V(s_{t+1}) - V(s_t)
-            td_error = rewards[t] + gamma * pred_next_values[t] * (1 - dones[t]) - pred_values[t]
+            _next_value = rewards[t] + gamma * pred_next_values[t] * (1 - dones[t])
+            critic_y[t] = _next_value
 
-            # z_0 = 0
-            # z_t = \gammma * \lambda * z_{t-1} + V(s_t)
-            z = gamma * lambda_ * (1 - dones[t]) * z + td_error
-
-            discounted_return[t] = z + pred_values[t]
-        advantage = discounted_return - pred_values
-        return discounted_return, advantage
+        actor_y = critic_y - pred_values
+        return critic_y, actor_y
 
     def clean_queues(self):
         self.dq_actions.clear()
@@ -470,8 +463,7 @@ class A2CTrain(object):
 class A2CMarioTrain(A2CTrain):
 
     def create_env(self) -> gym.Env:
-        env = gym_super_mario_bros.make(self.game_id)
-        env = JoypadSpace(env, SIMPLE_MOVEMENT)
+        env = gym.make('BreakoutDeterministic-v4')
         return env
 
 
@@ -481,11 +473,10 @@ def process_reward(states: np.ndarray, actions: np.ndarray, next_states: np.ndar
 
 
 def main():
-    env = gym_super_mario_bros.make('SuperMarioBros-v0')
-    env = JoypadSpace(env, SIMPLE_MOVEMENT)
-    n_action = 2  # 1:앞 | 2:점프
-    resized_input_shape = (100, 80)
-    n_processor = 8
+    env = gym.make('BreakoutDeterministic-v4')
+    n_action = env.action_space.n
+    resized_input_shape = (84, 84)
+    n_processor = 16
     n_history = 4
     n_step = 5
 
@@ -496,7 +487,7 @@ def main():
 
     # Hyperparameters
     a2c_model = A2CModel(resized_input_shape, n_action, n_history=n_history)
-    a2c_train = A2CMarioTrain('SuperMarioBros-v0', a2c_model, n_processor=n_processor, render=True, cuda=True,
+    a2c_train = A2CMarioTrain('BreakoutDeterministic-v4', a2c_model, n_processor=n_processor, render=True, cuda=True,
                               n_step=n_step, n_action=n_action, input_shape=resized_input_shape,
                               process_reward=process_reward)
     a2c_train.train()
