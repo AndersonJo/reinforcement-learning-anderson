@@ -1,5 +1,9 @@
+import os
+import shutil
+from argparse import ArgumentParser
 from collections import deque
 from multiprocessing.connection import Connection
+from time import sleep
 from typing import List, Tuple, Callable
 
 import cv2
@@ -11,6 +15,16 @@ import torch.nn.functional as F
 from torch import optim
 from torch.distributions import Categorical
 from torch.multiprocessing import Process, Pipe
+
+
+def get_args():
+    parser = ArgumentParser()
+    parser.add_argument('mode', default='test', help='train | test')
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/breakout.model')
+    args = parser.parse_args()
+
+    assert args.mode in ['test', 'train']
+    return args
 
 
 class Flatten(nn.Module):
@@ -245,14 +259,14 @@ class A2CAgent(Agent):
     pass
 
 
-class A2CTrain(object):
+class A2C(object):
     """
     Advantage Actor Critic Trainer with N-Step bootstrapping
     """
 
     def __init__(self, game_id: str, model: nn.Module, input_shape: Tuple[int, int], n_step: int, n_action: int,
                  n_processor: int = 1, render: bool = False, n_history: int = 4, cuda=False,
-                 process_reward: Callable = None):
+                 checkpoint: str = None, process_reward: Callable = None):
         self.game_id = game_id
         self.model = model
         self.input_shape = input_shape
@@ -263,18 +277,26 @@ class A2CTrain(object):
         self.n_history = n_history
         self.device: str = 'cuda' if cuda else 'cpu'
 
+        # Make checkpoint directory
+        self.checkpoint = checkpoint
+        if self.checkpoint is not None:
+            checkpoint_path = os.path.dirname(checkpoint)
+            if not os.path.exists(checkpoint_path):
+                os.mkdir(checkpoint_path)
+
         # Functions
         self.process_reward = process_reward
 
         # Initialize Agent
         self.agent: A2CAgent = A2CAgent(model, n_action=n_action, cuda=cuda)
-        # self.agent.model.load_state_dict(torch.load('checkpoints/mario.model'))
+        if self.checkpoint is not None and self.checkpoint.endswith('.model'):
+            print(f'{self.checkpoint} has been loaded')
+            self.agent.model.load_state_dict(torch.load(self.checkpoint))
 
         # Initialize Environments
         self.envs: List[MultiProcessEnv] = []
         self.parent_conns: List[Connection] = []
         self.child_conns: List[Connection] = []
-        self._init_envs()
 
         # N-Step storing variables
         self.dq_states = deque(maxlen=n_step)  # (n_step, n_processor, 4, 120, 128)
@@ -285,8 +307,8 @@ class A2CTrain(object):
         self.dq_actions = deque(maxlen=n_step)
         self.dq_infos = deque(maxlen=n_step)
 
-    def _init_envs(self):
-        for idx in range(self.n_processor):
+    def _init_envs(self, n_processor: int):
+        for idx in range(n_processor):
             parent_conn, child_conn = Pipe()
             env = self.create_env()
             env_processor = MultiProcessEnv(idx, env, child_conn,
@@ -309,13 +331,35 @@ class A2CTrain(object):
         states = np.zeros([self.n_processor, self.n_history, *self.input_shape])
         return states
 
+    def test(self):
+        self._init_envs(1)
+        agent = self.agent
+
+        # Prepare Test
+        step = -1
+        states = self.initialize_states()
+
+        while True:
+            action = agent.get_action(states)
+
+            # Interact with environments
+            self.send_actions(action)
+            next_states, rewards, dones, infos = self.receive_from_envs()
+
+            # Update states <- next_states
+            states = next_states[:, :, :, :]
+
+            sleep(0.01)
+
     def train(self, gamma: float = 0.99, lambda_: float = 0.95):
+        self._init_envs(self.n_processor)
+
         agent = self.agent
 
         # Prepare Training
+        step = -1
         states = self.initialize_states()
 
-        step = -1
         while True:
             self.clean_queues()
             step += 1
@@ -347,7 +391,7 @@ class A2CTrain(object):
 
             if step % 500 == 0:
                 print(f'saved | actions:{group_actions}')
-                torch.save(agent.model.state_dict(), 'checkpoints/mario.model')
+                torch.save(agent.model.state_dict(), self.checkpoint)
 
     def _store_data(self, states: np.ndarray, actions: np.ndarray, next_states: np.ndarray, rewards: np.ndarray,
                     dones: np.ndarray, infos: list):
@@ -441,11 +485,13 @@ class A2CTrain(object):
         :param pred_next_values: an array of the n-step V(s_{t+1}) from a single processor
         :param dones:
         """
+
+        # N-Step Bootstrapping
         critic_y = np.zeros(self.n_step)  # discounted rewards
-        # _next_value = pred_next_values[-1]
+        _next_value = pred_next_values[-1]
         for t in range(self.n_step - 1, -1, -1):
             # 1-step TD: V(s_t) r_t + \gamma V(s_{t+1}) - V(s_t)
-            _next_value = rewards[t] + gamma * pred_next_values[t] * (1 - dones[t])
+            _next_value = rewards[t] + gamma * _next_value * (1 - dones[t])
             critic_y[t] = _next_value
 
         actor_y = critic_y - pred_values
@@ -460,7 +506,7 @@ class A2CTrain(object):
         self.dq_infos.clear()
 
 
-class A2CMarioTrain(A2CTrain):
+class A2CBreakout(A2C):
 
     def create_env(self) -> gym.Env:
         env = gym.make('BreakoutDeterministic-v4')
@@ -473,6 +519,8 @@ def process_reward(states: np.ndarray, actions: np.ndarray, next_states: np.ndar
 
 
 def main():
+    args = get_args()
+
     env = gym.make('BreakoutDeterministic-v4')
     n_action = env.action_space.n
     resized_input_shape = (84, 84)
@@ -487,10 +535,14 @@ def main():
 
     # Hyperparameters
     a2c_model = A2CModel(resized_input_shape, n_action, n_history=n_history)
-    a2c_train = A2CMarioTrain('BreakoutDeterministic-v4', a2c_model, n_processor=n_processor, render=True, cuda=True,
-                              n_step=n_step, n_action=n_action, input_shape=resized_input_shape,
-                              process_reward=process_reward)
-    a2c_train.train()
+    a2c_breakout = A2CBreakout('BreakoutDeterministic-v4', a2c_model, n_processor=n_processor, render=True, cuda=True,
+                               n_step=n_step, n_action=n_action, input_shape=resized_input_shape,
+                               process_reward=process_reward, checkpoint=args.checkpoint)
+
+    if args.mode == 'train':
+        a2c_breakout.train()
+    elif args.mode == 'test':
+        a2c_breakout.test()
 
 
 if __name__ == '__main__':
