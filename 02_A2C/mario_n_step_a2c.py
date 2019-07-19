@@ -8,10 +8,13 @@ from typing import List, Tuple, Callable
 
 import cv2
 import gym
+import gym_super_mario_bros
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from gym_super_mario_bros.actions import SIMPLE_MOVEMENT
+from nes_py.wrappers import JoypadSpace
 from torch import optim
 from torch.distributions import Categorical
 from torch.multiprocessing import Process, Pipe
@@ -159,9 +162,9 @@ class MultiProcessEnv(Process):
                 self.reset()
 
     def is_done(self, info):
-        if 'ale.lives' in info:
-            if info['ale.lives'] < self.lives or info['ale.lives'] <= 0:
-                self.lives = info['ale.lives']
+        if 'life' in info:
+            if info['life'] < self.lives or info['life'] <= 0:
+                self.lives = info['life']
                 return True
         return False
 
@@ -511,7 +514,8 @@ class A2C(object):
 class A2CBreakout(A2C):
 
     def create_env(self) -> gym.Env:
-        env = gym.make('BreakoutDeterministic-v4')
+        env = gym_super_mario_bros.make('SuperMarioBros-v0')
+        env = JoypadSpace(env, SIMPLE_MOVEMENT)
         return env
 
 
@@ -523,7 +527,8 @@ def process_reward(states: np.ndarray, actions: np.ndarray, next_states: np.ndar
 def main():
     args = get_args()
 
-    env = gym.make('BreakoutDeterministic-v4')
+    env = gym_super_mario_bros.make('SuperMarioBros-v0')
+    env = JoypadSpace(env, SIMPLE_MOVEMENT)
     n_action = env.action_space.n
     resized_input_shape = (84, 84)
     n_processor = 16
@@ -537,7 +542,7 @@ def main():
 
     # Hyperparameters
     a2c_model = A2CModel(resized_input_shape, n_action, n_history=n_history)
-    a2c_breakout = A2CBreakout('BreakoutDeterministic-v4', a2c_model, n_processor=n_processor, render=True, cuda=True,
+    a2c_breakout = A2CBreakout('SuperMarioBros-v0', a2c_model, n_processor=n_processor, render=True, cuda=True,
                                n_step=n_step, n_action=n_action, input_shape=resized_input_shape,
                                process_reward=process_reward, checkpoint=args.checkpoint)
 
