@@ -244,6 +244,9 @@ class Agent(object):
         # Actor loss
         actor_loss = -m.log_prob(actions) * actor_y
 
+        import ipdb
+        ipdb.set_trace()
+
         # Entorpy
         entropy = m.entropy()
 
