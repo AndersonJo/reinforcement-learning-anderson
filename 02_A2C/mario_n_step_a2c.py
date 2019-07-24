@@ -244,9 +244,6 @@ class Agent(object):
         # Actor loss
         actor_loss = -m.log_prob(actions) * actor_y
 
-        import ipdb
-        ipdb.set_trace()
-
         # Entorpy
         entropy = m.entropy()
 
@@ -256,8 +253,6 @@ class Agent(object):
         # Loss
         loss = actor_loss.mean() + 0.5 * critic_loss - entropy_coef * entropy.mean()
 
-        import ipdb
-        ipdb.set_trace()
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
@@ -503,6 +498,7 @@ class A2C(object):
             critic_y[t] = _next_value
 
         actor_y = critic_y - pred_values
+
         return critic_y, actor_y
 
     def clean_queues(self):

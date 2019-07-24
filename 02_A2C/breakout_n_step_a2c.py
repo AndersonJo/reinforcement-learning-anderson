@@ -245,13 +245,11 @@ class Agent(object):
         entropy = m.entropy()
 
         # Critic loss
-        critic_loss = self.mse(pred_value.sum(1), critic_y)
+        critic_loss = self.mse(pred_value.view(-1), critic_y)
 
         # Loss
         loss = actor_loss.mean() + 0.5 * critic_loss - entropy_coef * entropy.mean()
 
-        import ipdb
-        ipdb.set_trace()
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
@@ -462,9 +460,16 @@ class A2C(object):
         group_critic_y = []
         group_actor_y = []
         for idx in range(self.n_processor):
+            # r_{t+1}, r_{t+2}, ... r_{t+4}
             _rewards = group_rewards[idx * self.n_step: (idx + 1) * self.n_step]
+
+            # V(s_t), V(s_{t+1}), ..., V(s_{t+4})
             _pred_values = pred_values[idx * self.n_step: (idx + 1) * self.n_step]
+
+            # V(s_{t+1}), V(s_{t+2}), ..., V(s_{t+5})
             _pred_next_values = pred_next_values[idx * self.n_step: (idx + 1) * self.n_step]
+
+            # d_{t+1, d_{t+2}, ..., d_{t+5}
             _dones = group_dones[idx * self.n_step: (idx + 1) * self.n_step]
 
             critic_y, actor_y = self._build_targets(_rewards, _pred_values, _pred_next_values,
@@ -497,6 +502,7 @@ class A2C(object):
             critic_y[t] = _next_value
 
         actor_y = critic_y - pred_values
+
         return critic_y, actor_y
 
     def clean_queues(self):
