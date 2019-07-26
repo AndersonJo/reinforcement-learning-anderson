@@ -291,8 +291,9 @@ class A2C(object):
         # Initialize Agent
         self.agent: A2CAgent = A2CAgent(model, n_action=n_action, cuda=cuda)
         if self.checkpoint is not None and self.checkpoint.endswith('.model'):
-            print(f'{self.checkpoint} has been loaded')
-            self.agent.model.load_state_dict(torch.load(self.checkpoint))
+            if os.path.exists(self.checkpoint):
+                print(f'{self.checkpoint} has been loaded')
+                self.agent.model.load_state_dict(torch.load(self.checkpoint))
 
         # Initialize Environments
         self.envs: List[MultiProcessEnv] = []

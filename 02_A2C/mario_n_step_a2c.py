@@ -1,7 +1,7 @@
 import os
 import shutil
 from argparse import ArgumentParser
-from collections import deque
+from collections import deque, defaultdict
 from multiprocessing.connection import Connection
 from time import sleep
 from typing import List, Tuple, Callable
@@ -13,7 +13,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from gym_super_mario_bros.actions import SIMPLE_MOVEMENT
+from gym.error import UnregisteredEnv
+from gym_super_mario_bros.actions import SIMPLE_MOVEMENT, RIGHT_ONLY
+
 from nes_py.wrappers import JoypadSpace
 from torch import optim
 from torch.distributions import Categorical
@@ -23,7 +25,7 @@ from torch.multiprocessing import Process, Pipe
 def get_args():
     parser = ArgumentParser()
     parser.add_argument('mode', default='test', help='train | test')
-    parser.add_argument('--checkpoint', type=str, default='checkpoints/breakout.model')
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/mario.model')
     args = parser.parse_args()
 
     assert args.mode in ['test', 'train']
@@ -110,13 +112,16 @@ class MultiProcessEnv(Process):
         self.input_size = input_size
         self.render = render
 
-        # BreakOut Specific Variables
-        self.lives = env.env.ale.lives()
+        # Mario Specific Variables
+        self.lives = 3
 
         # Game State Variables
+        self.stage = 1
         self.step = 0
         self._reward = 0
         self._reward_dq = deque(maxlen=100)
+        self.actions = defaultdict(int)
+        self._move_dq = deque(maxlen=500)
 
         # Set Replay Memory
         self.n_history = n_history
@@ -129,37 +134,55 @@ class MultiProcessEnv(Process):
         self.reset()
         env = self.env
         render = self.render
-
         episode = 0
-
+        prev_x_pos = 0
         while True:
             action = self.child_conn.recv()
+            self.actions[action] += 1
 
             if render:
                 env.render()
 
             next_state, reward, done, info = env.step(action)
+            reward /= 100
+            self._move_dq.append(info['x_pos'])
             die = self.is_done(info)
-            if die:
-                reward -= 1
+
+            if info['flag_get'] or self.stage < info['stage']:
+                reward += 10.
+                self.stage = info['stage']
+            elif die:
+                reward = -1
+            elif prev_x_pos >= info['x_pos']:
+                reward = 0
 
             self.memory_state(next_state)
             self.step += 1
             self._reward += reward
 
+            # Check Life
+            if info['life'] <= 0:
+                done = True
+
+            # Check No Move
+            move_var = np.var(self._move_dq)
+            if (len(self._move_dq) >= self._move_dq.maxlen) and move_var < 3:
+                done = True
+                reward = -1
+
             # Send information to Parent Processor
             self.child_conn.send([self.history, reward, done or die, info])
-
-            # Check
-            # if info['life'] <= 0:
-            #     done = True
+            self._reward_dq.append(self._reward)
 
             if done:
-                self._reward_dq.append(self._reward)
                 episode += 1
-                print(f'[{self.process_idx}] episode:{episode} | step:{self.step} | reward: {self._reward} | '
-                      f'reward mean:{np.mean(self._reward_dq)}')
+                print(f'[{self.process_idx:2}] epi:{episode:4} | step:{self.step:<5} | '
+                      f'reward: {round(self._reward, 2):<6} | '
+                      f'reward mean:{round(np.mean(self._reward_dq), 2):<6} | '
+                      f'move_var: {round(move_var, 2):<8} | actions: {dict(self.actions)}')
                 self.reset()
+
+            prev_x_pos = info['x_pos']
 
     def is_done(self, info):
         if 'life' in info:
@@ -186,7 +209,11 @@ class MultiProcessEnv(Process):
         self.env.reset()
         self.step = 0
         self._reward = 0
-        self.lives = self.env.env.ale.lives()
+        self.lives = 3
+        self.actions = defaultdict(int)
+        self.stage = 1
+        self._reward_dq.clear()
+        self._move_dq.clear()
 
         # Initialize Replay Memory
         init_state = self.env.reset()
@@ -248,7 +275,7 @@ class Agent(object):
         entropy = m.entropy()
 
         # Critic loss
-        critic_loss = self.mse(pred_value.sum(1), critic_y)
+        critic_loss = self.mse(pred_value.view(-1), critic_y)
 
         # Loss
         loss = actor_loss.mean() + 0.5 * critic_loss - entropy_coef * entropy.mean()
@@ -294,8 +321,9 @@ class A2C(object):
         # Initialize Agent
         self.agent: A2CAgent = A2CAgent(model, n_action=n_action, cuda=cuda)
         if self.checkpoint is not None and self.checkpoint.endswith('.model'):
-            print(f'{self.checkpoint} has been loaded')
-            self.agent.model.load_state_dict(torch.load(self.checkpoint))
+            if os.path.exists(self.checkpoint):
+                print(f'{self.checkpoint} has been loaded')
+                self.agent.model.load_state_dict(torch.load(self.checkpoint))
 
         # Initialize Environments
         self.envs: List[MultiProcessEnv] = []
@@ -463,9 +491,16 @@ class A2C(object):
         group_critic_y = []
         group_actor_y = []
         for idx in range(self.n_processor):
+            # r_{t+1}, r_{t+2}, ... r_{t+4}
             _rewards = group_rewards[idx * self.n_step: (idx + 1) * self.n_step]
+
+            # V(s_t), V(s_{t+1}), ..., V(s_{t+4})
             _pred_values = pred_values[idx * self.n_step: (idx + 1) * self.n_step]
+
+            # V(s_{t+1}), V(s_{t+2}), ..., V(s_{t+5})
             _pred_next_values = pred_next_values[idx * self.n_step: (idx + 1) * self.n_step]
+
+            # d_{t+1, d_{t+2}, ..., d_{t+5}
             _dones = group_dones[idx * self.n_step: (idx + 1) * self.n_step]
 
             critic_y, actor_y = self._build_targets(_rewards, _pred_values, _pred_next_values,
@@ -513,8 +548,16 @@ class A2C(object):
 class A2CBreakout(A2C):
 
     def create_env(self) -> gym.Env:
-        env = gym_super_mario_bros.make('SuperMarioBros-v0')
-        env = JoypadSpace(env, SIMPLE_MOVEMENT)
+        while True:
+            try:
+                world = np.random.randint(1, 9)
+                stage = np.random.randint(1, 4)
+
+                env_id = f'SuperMarioBros-{world}-{stage}-v0'
+                env = JoypadSpace(gym_super_mario_bros.make(env_id), SIMPLE_MOVEMENT)
+            except UnregisteredEnv as e:
+                continue
+            break
         return env
 
 
@@ -526,11 +569,11 @@ def process_reward(states: np.ndarray, actions: np.ndarray, next_states: np.ndar
 def main():
     args = get_args()
 
-    env = gym_super_mario_bros.make('SuperMarioBros-v0')
-    env = JoypadSpace(env, SIMPLE_MOVEMENT)
+    env_id = 'SuperMarioBros-v0'
+    env = JoypadSpace(gym_super_mario_bros.make(env_id), SIMPLE_MOVEMENT)
     n_action = env.action_space.n
     resized_input_shape = (84, 84)
-    n_processor = 16
+    n_processor = 18
     n_history = 4
     n_step = 5
 
