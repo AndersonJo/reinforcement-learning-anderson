@@ -32,74 +32,88 @@ def get_args():
     return args
 
 
-class Flatten(nn.Module):
-    def forward(self, input: torch.Tensor):
-        return input.view(input.size(0), -1)
-
-
 class A2CModel(nn.Module):
     def __init__(self, input_shape, n_action: int, n_history: int):
         super(A2CModel, self).__init__()
 
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels=4,
+            nn.Conv2d(in_channels=4,  # history frame
                       out_channels=32,
-                      kernel_size=8,
-                      stride=4),
-            nn.LeakyReLU(),
+                      kernel_size=4,
+                      stride=3,
+                      padding=2),
+            nn.ELU(),
             nn.Conv2d(in_channels=32,
                       out_channels=64,
+                      kernel_size=5,
+                      stride=2,
+                      padding=2),
+            nn.ELU(),
+            nn.Conv2d(in_channels=64,
+                      out_channels=64,
                       kernel_size=4,
-                      stride=2),
-            nn.LeakyReLU(),
+                      stride=2,
+                      padding=1),
+            nn.ELU(),
             nn.Conv2d(in_channels=64,
                       out_channels=64,
                       kernel_size=3,
-                      stride=1),
-            nn.LeakyReLU())
+                      stride=2,
+                      padding=1),
+            nn.ELU(),
+            nn.Conv2d(in_channels=64,
+                      out_channels=96,
+                      kernel_size=3,
+                      stride=2,
+                      padding=1),
+            nn.ELU()
+        )
+
         conv_output_size = self._calculate_output_size(input_shape, n_history)
 
-        # Flatten
-        self.flatten = Flatten()
+        self.lstm = nn.LSTMCell(conv_output_size, 512)
 
         # Actor
-        self.policy = nn.Sequential(
-            nn.Linear(in_features=conv_output_size, out_features=512),
-            nn.ReLU(),
-            nn.Linear(in_features=512, out_features=n_action))
+        self.policy = nn.Linear(in_features=512, out_features=n_action)
 
         # Critic
-        self.critic = nn.Sequential(
-            nn.Linear(in_features=conv_output_size, out_features=512),
-            nn.ReLU(),
-            nn.Linear(in_features=512, out_features=1))
+        self.critic = nn.Linear(in_features=512, out_features=1)
 
         for p in self.modules():
             if isinstance(p, nn.Conv2d):
+                print('CNN initialized')
                 torch.nn.init.xavier_uniform_(p.weight)
-                # nn.init.kaiming_uniform_(p.weight)
-                p.bias.data.zero_()
+                torch.nn.init.constant_(p.bias, 0)
 
             elif isinstance(p, nn.Linear):
-                # torch.nn.init.xavier_uniform_(p.weight)
-                nn.init.kaiming_uniform_(p.weight, a=1.)
-                p.bias.data.zero_()
+                print('Linear initialized')
+                torch.nn.init.xavier_uniform_(p.weight)
+                torch.nn.init.constant_(p.bias, 0)
+
+            elif isinstance(p, nn.LSTMCell):
+                print('LSTM initialized')
+                torch.nn.init.constant_(p.bias_ih, 0)
+                torch.nn.init.constant_(p.bias_hh, 0)
 
     def _calculate_output_size(self, input_shape: tuple, n_history: int) -> int:
         o = self.conv(torch.zeros(1, n_history, *input_shape))
         output_size = int(np.prod(o.size()))
         return output_size
 
-    def forward(self, states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, states: torch.Tensor, hx: torch.Tensor, cx: torch.Tensor) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
+        :param hx: (batch, hidden_size): tensor containing the initial hidden state for each element in the batch.
+        :param cx: (batch, hidden_size): tensor containing the initial cell state for each element in the batch.
         :param states: [1, 4, 120, 128] Tensor
         """
         h = self.conv(states)  # [1, 512] Tensor
-        h = self.flatten(h)
+        h = h.view(h.size(0), -1)  # flatten
+        next_hx, next_cx = self.lstm(h, (hx, cx))
 
-        policy = self.policy(h)  # [1, 7] Tensor
-        value = self.critic(h)  # [1, 1] Tensor
-        return policy, value
+        logits = self.policy(hx)  # [1, 7] Tensor
+        value = self.critic(hx)  # [1, 1] Tensor
+        return logits, value, next_hx, next_cx
 
 
 class MultiProcessEnv(Process):
@@ -111,17 +125,20 @@ class MultiProcessEnv(Process):
         self.child_conn = child_conn
         self.input_size = input_size
         self.render = render
+        self.skip = 4
 
         # Mario Specific Variables
-        self.lives = 3
+        self.lives = 2
 
         # Game State Variables
         self.stage = 1
         self.step = 0
         self._reward = 0
+        self._cur_score = 0
+        self._score_dq = deque(maxlen=100)
         self._reward_dq = deque(maxlen=100)
-        self.actions = defaultdict(int)
         self._move_dq = deque(maxlen=500)
+        self.actions = defaultdict(int)
 
         # Set Replay Memory
         self.n_history = n_history
@@ -138,66 +155,81 @@ class MultiProcessEnv(Process):
         prev_x_pos = 0
         while True:
             action = self.child_conn.recv()
-            self.actions[action] += 1
+            done = False
+            info = None
+            move_var = 0
+            total_reward = 0
+            for _ in range(self.skip):
+                self.actions[action] += 1
 
-            if render:
-                env.render()
+                if render:
+                    env.render()
 
-            next_state, reward, done, info = env.step(action)
-            reward /= 100
-            self._move_dq.append(info['x_pos'])
-            die = self.is_done(info)
+                next_state, reward, done, info = env.step(action)
+                score = (info['score'] - self._cur_score) / 50.
+                reward += score
 
-            if info['flag_get'] or self.stage < info['stage']:
-                reward += 10.
-                self.stage = info['stage']
-            elif die:
-                reward = -1
-            elif prev_x_pos >= info['x_pos']:
-                reward = 0
+                if score > 0:
+                    self._score_dq.append(score)
 
-            self.memory_state(next_state)
-            self.step += 1
-            self._reward += reward
+                if done:
+                    if info['flag_get']:
+                        reward += 50.
+                        self.stage = info['stage']
+                    else:
+                        reward -= 50
 
-            # Check Life
-            if info['life'] <= 0:
-                done = True
+                self.memory_state(next_state)
 
-            # Check No Move
-            move_var = np.var(self._move_dq)
-            if (len(self._move_dq) >= self._move_dq.maxlen) and move_var < 3:
-                done = True
-                reward = -1
+                # Check No Move
+                self._move_dq.append(info['x_pos'])
+                move_var = np.var(self._move_dq)
+                if (len(self._move_dq) >= self._move_dq.maxlen) and move_var < 3:
+                    reward -= 50
+                    done = True
+
+                # Normalize reward
+                reward /= 15
+                self._reward += reward
+                total_reward += reward
+                self.step += 1
+
+                if done:
+                    break
 
             # Send information to Parent Processor
-            self.child_conn.send([self.history, reward, done or die, info])
+            self.child_conn.send([self.history, total_reward, done, info])
             self._reward_dq.append(self._reward)
 
             if done:
                 episode += 1
-                print(f'[{self.process_idx:2}] epi:{episode:4} | step:{self.step:<5} | '
-                      f'reward: {round(self._reward, 2):<6} | '
-                      f'reward mean:{round(np.mean(self._reward_dq), 2):<6} | '
-                      f'move_var: {round(move_var, 2):<8} | actions: {dict(self.actions)}')
+
+                print(f'[{self.process_idx:2}] epi:{episode:5} | step:{self.step:<4} | '
+                      f'acum:{int(self._reward):<4} | '
+                      f'mean:{int(np.mean(self._reward_dq)):<4} | '
+                      f'last:{round(reward, 1):<4} | '
+                      f'score:{int(np.mean(self._score_dq)):<2} | '
+                      f'move:{int(move_var):<6} | act:{dict(self.actions)}')
                 self.reset()
 
             prev_x_pos = info['x_pos']
+            self.stage = info['stage']
+            self._cur_score = info['score']
 
-    def is_done(self, info):
-        if 'life' in info:
-            if info['life'] < self.lives or info['life'] <= 0:
-                self.lives = info['life']
-                return True
-        return False
+    # def is_done(self, info):
+    #     if info['life'] < self.lives or info['life'] < 0:
+    #         self.lives = info['life']
+    #         return True
+    #     return False
 
     @property
     def shape(self) -> tuple:
         return self.env.observation_space.shape
 
     def memory_state(self, state):
-        self.history[:3, :, :] = self.history[1:, :, :]
-        self.history[3, :, :] = self.preprocess(state)
+        idx = self.n_history - 1
+        self.history[:idx, :, :] = self.history[1:, :, :]
+        self.history[idx, :, :] = self.preprocess(state)
 
     def preprocess(self, state: np.ndarray):
         h = cv2.cvtColor(state, cv2.COLOR_RGB2GRAY)
@@ -208,12 +240,16 @@ class MultiProcessEnv(Process):
     def reset(self):
         self.env.reset()
         self.step = 0
+        self._cur_score = 0
         self._reward = 0
-        self.lives = 3
+        self.lives = 2
         self.actions = defaultdict(int)
         self.stage = 1
+        self._score_dq.clear()
         self._reward_dq.clear()
         self._move_dq.clear()
+
+        self._score_dq.append(0)
 
         # Initialize Replay Memory
         init_state = self.env.reset()
@@ -232,40 +268,56 @@ class Agent(object):
         self.ce = nn.CrossEntropyLoss()
         self.mse = nn.MSELoss()
 
-    def get_action(self, states: np.ndarray) -> np.ndarray:
+    def get_action(self, states: np.ndarray, h_0: np.ndarray, c_0: np.ndarray) -> Tuple[
+        np.ndarray, np.ndarray, np.ndarray]:
         """
+        :param h_0: hidden state for LSTM
+        :param c_0: cell state for LSTM
         :param states: preprocessed states
         :return: a list of actions -> [1, 0, 2, 3, 0, 1, ...]
         """
         states = torch.from_numpy(states).float().to(self.device)
-        policy, value = self.model(states)
-        softmax_policy = F.softmax(policy, dim=-1)
-        actions = softmax_policy.multinomial(1).view(-1).cpu().numpy()  # 가중치에 따라서 action을 선택
-        # policy = F.softmax(policy, dim=-1).data.cpu().numpy()
-        # actions = self.random_choice_prob_index(policy)
-        return actions
+        h_0 = torch.from_numpy(h_0).float().to(self.device)
+        c_0 = torch.from_numpy(c_0).float().to(self.device)
 
-    def predict_transition(self, states: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        logits, value, next_hidden, next_cell = self.model(states, h_0, c_0)
+        policy = F.softmax(logits, dim=-1)
+        actions = policy.multinomial(1).view(-1).cpu().numpy()  # 가중치에 따라서 action을 선택
+
+        next_hidden = next_hidden.cpu().detach().numpy()
+        next_cell = next_cell.cpu().detach().numpy()
+        return actions, next_hidden, next_cell
+
+    def predict_transition(self, states: np.ndarray, h_0: np.ndarray, c_0: np.ndarray) -> Tuple[
+        np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
          - policy: \pi(a_t, s_t)
          - value: V(s_t)
         """
         # Calculate current policy and value
         states_tensor = torch.from_numpy(states).to(self.device).float()
-        pred_policies, pred_values = self.model(states_tensor)
+        h_0 = torch.from_numpy(h_0).float().to(self.device)
+        c_0 = torch.from_numpy(c_0).float().to(self.device)
+
+        pred_policies, pred_values, next_hidden, next_cell = self.model(states_tensor, h_0, c_0)
         pred_policies = pred_policies.view(-1).data.cpu().numpy()
         pred_values = pred_values.view(-1).data.cpu().numpy()
-        return pred_policies, pred_values
+        next_hidden = next_hidden.data.cpu().numpy()
+        next_cell = next_cell.data.cpu().numpy()
+        return pred_policies, pred_values, next_hidden, next_cell
 
-    def train(self, actions, states, next_states, critic_y, actor_y, entropy_coef=0.02):
+    def train(self, group_states, group_next_states, group_actions, group_critic_y, group_actor_y,
+              group_hidden, group_cell, group_next_hidden, group_next_cell, entropy_coef=0.02):
         with torch.no_grad():  # It makes tensors set "requires_grad" to be false
-            states = torch.FloatTensor(states).to(self.device)
-            next_states = torch.FloatTensor(next_states).to(self.device)
-            actions = torch.LongTensor(actions).to(self.device)
-            critic_y = torch.FloatTensor(critic_y).to(self.device)
-            actor_y = torch.FloatTensor(actor_y).to(self.device)
+            states = torch.FloatTensor(group_states).to(self.device)
+            next_states = torch.FloatTensor(group_next_states).to(self.device)
+            actions = torch.LongTensor(group_actions).to(self.device)
+            critic_y = torch.FloatTensor(group_critic_y).to(self.device)
+            actor_y = torch.FloatTensor(group_actor_y).to(self.device)
+            group_hidden = torch.FloatTensor(group_hidden).to(self.device)
+            group_cell = torch.FloatTensor(group_cell).to(self.device)
 
-        pred_policy, pred_value = self.model(states)
+        pred_policy, pred_value, next_h, next_c = self.model(states, group_hidden, group_cell)
         m = Categorical(F.softmax(pred_policy, dim=-1))
 
         # Actor loss
@@ -306,6 +358,7 @@ class A2C(object):
         self.n_processor = n_processor
         self.render = render
         self.n_history = n_history
+        self.skip = 4
         self.device: str = 'cuda' if cuda else 'cpu'
 
         # Make checkpoint directory
@@ -338,15 +391,23 @@ class A2C(object):
         self.dq_dones = deque(maxlen=n_step)
         self.dq_actions = deque(maxlen=n_step)
         self.dq_infos = deque(maxlen=n_step)
+        self.dq_hidden_state = deque(maxlen=n_step)
+        self.dq_cell_state = deque(maxlen=n_step)
+        self.dq_next_hidden_state = deque(maxlen=n_step)
+        self.dq_next_cell_state = deque(maxlen=n_step)
 
     def _init_envs(self, n_processor: int):
         for idx in range(n_processor):
             parent_conn, child_conn = Pipe()
             env = self.create_env()
+            render = False
+            if idx == 0:
+                render = True
+
             env_processor = MultiProcessEnv(idx, env, child_conn,
                                             input_size=self.input_shape,
                                             n_history=self.n_history,
-                                            render=self.render)
+                                            render=render)
             env_processor.start()
             self.envs.append(env_processor)
             self.parent_conns.append(parent_conn)
@@ -356,12 +417,14 @@ class A2C(object):
         env = gym.make(self.game_id)
         return env
 
-    def initialize_states(self) -> np.ndarray:
+    def initialize_states(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         :return: [n_envs, 4, 120, 128]
         """
         states = np.zeros([self.n_processor, self.n_history, *self.input_shape])
-        return states
+        h_0 = np.zeros([self.n_processor, 512], dtype=np.float)  # initial hidden state for LSTM
+        c_0 = np.zeros([self.n_processor, 512], dtype=np.float)  # initial cell state for LSTM
+        return states, h_0, c_0
 
     def test(self):
         self._init_envs(1)
@@ -369,10 +432,10 @@ class A2C(object):
 
         # Prepare Test
         step = -1
-        states = self.initialize_states()
+        states, h_0, c_0 = self.initialize_states()
 
         while True:
-            action = agent.get_action(states)
+            action, h_0, c_0 = agent.get_action(states, h_0, c_0)
 
             # Interact with environments
             self.send_actions(action)
@@ -390,7 +453,7 @@ class A2C(object):
 
         # Prepare Training
         step = -1
-        states = self.initialize_states()
+        states, h_0, c_0 = self.initialize_states()
 
         while True:
             self.clean_queues()
@@ -398,7 +461,7 @@ class A2C(object):
 
             for _ in range(self.n_step):
                 # Get Action
-                actions = agent.get_action(states)
+                actions, next_h, next_c = agent.get_action(states, h_0, c_0)
 
                 # Interact with environments
                 self.send_actions(actions)
@@ -406,36 +469,39 @@ class A2C(object):
                 rewards = self.process_reward(states, actions, next_states, rewards, dones, infos)
 
                 # Store environment data
-                self._store_data(states, actions, next_states, rewards, dones, infos)
+                self._store_data(states, actions, next_states, rewards, dones, infos, h_0, c_0, next_h, next_c)
 
                 # Update states <- next_states
                 states = next_states[:, :, :, :]
+                h_0 = next_h
+                c_0 = next_c
 
             # Train Policy and Value Networks
             target_data = self._build_target_data(gamma=gamma, lambda_=lambda_)
-            group_states, group_next_states, group_actions, group_critic_y, group_actor_y = target_data
 
-            self.agent.train(group_actions,
-                             group_states,
-                             group_next_states,
-                             group_critic_y,
-                             group_actor_y)
+            self.agent.train(*target_data)
 
             if step % 500 == 0:
-                print(f'saved | actions:{group_actions}')
                 torch.save(agent.model.state_dict(), self.checkpoint)
+                print('saved model')
 
     def _store_data(self, states: np.ndarray, actions: np.ndarray, next_states: np.ndarray, rewards: np.ndarray,
-                    dones: np.ndarray, infos: list):
+                    dones: np.ndarray, infos: list,
+                    h_0: np.ndarray, c_0: np.ndarray, next_h: np.ndarray, next_c: np.ndarray):
         self.dq_states.append(states)
         self.dq_actions.append(actions)
         self.dq_next_states.append(next_states)
         self.dq_rewards.append(rewards)
         self.dq_dones.append(dones)
         self.dq_infos.append(infos)
+        self.dq_hidden_state.append(h_0)
+        self.dq_cell_state.append(c_0)
+        self.dq_next_hidden_state.append(next_h)
+        self.dq_next_cell_state.append(next_c)
 
-    def _retrieve_data(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _retrieve_data(self) -> List[np.ndarray]:
         state_shape = [-1, self.n_history, *self.input_shape]
+        lstm_shape = [-1, 512]
 
         group_states = np.array(self.dq_states)  # shape: (step, processor, history, h, w)
         group_states = group_states.transpose([1, 0, 2, 3, 4])  # shape: (processor, step, history, h, w)
@@ -449,7 +515,13 @@ class A2C(object):
         group_actions = np.array(self.dq_actions).T.reshape(-1)
         group_dones = np.array(self.dq_dones).T.reshape(-1)
 
-        return group_states, group_next_states, group_rewards, group_actions, group_dones
+        group_hidden_states = np.array(self.dq_hidden_state).reshape(lstm_shape)
+        group_cell_states = np.array(self.dq_cell_state).reshape(lstm_shape)
+        group_next_hidden_states = np.array(self.dq_next_hidden_state).reshape(lstm_shape)
+        group_next_cell_states = np.array(self.dq_next_cell_state).reshape(lstm_shape)
+
+        return [group_states, group_next_states, group_rewards, group_actions, group_dones,
+                group_hidden_states, group_cell_states, group_next_hidden_states, group_next_cell_states]
 
     def send_actions(self, actions: np.ndarray):
         """
@@ -468,12 +540,12 @@ class A2C(object):
         next_states, rewards, dones, infos = [], [], [], []
         for parent_conn in self.parent_conns:
             next_state, reward, done, info = parent_conn.recv()
-            next_states.append(next_state)  # [4, 120, 128]
+            next_states.append(next_state)  # [4*4, 84, 84]
             rewards.append(reward)
             dones.append(done)
             infos.append(info)
 
-        next_states = np.stack(next_states)  # [n_envs, 4, 120, 128]
+        next_states = np.stack(next_states)  # [n_envs, 4*4, 84, 84]
         rewards = np.stack(rewards)
         dones = np.stack(dones).astype(np.int16)
 
@@ -481,11 +553,20 @@ class A2C(object):
 
     def _build_target_data(self, gamma: float, lambda_: float):
         # Retrieve grouped environment data : N-Step = Group
-        group_states, group_next_states, group_rewards, group_actions, group_dones = self._retrieve_data()
+        res = self._retrieve_data()
+        group_states = res[0]
+        group_next_states = res[1]
+        group_rewards = res[2]
+        group_actions = res[3]
+        group_dones = res[4]
+        group_hidden = res[5]
+        group_cell = res[6]
+        group_next_hidden = res[7]
+        group_next_cell = res[8]
 
         # predict transitions
-        pred_policies, pred_values = self.agent.predict_transition(group_states)
-        _, pred_next_values = self.agent.predict_transition(group_next_states)
+        pred_policies, pred_values, _, _ = self.agent.predict_transition(group_states, group_hidden, group_cell)
+        _, pred_next_values, _, _ = self.agent.predict_transition(group_next_states, group_next_hidden, group_next_cell)
 
         # Build Target
         group_critic_y = []
@@ -512,7 +593,8 @@ class A2C(object):
         group_critic_y = np.hstack(group_critic_y)
         group_actor_y = np.hstack(group_actor_y)
 
-        return group_states, group_next_states, group_actions, group_critic_y, group_actor_y
+        return [group_states, group_next_states, group_actions, group_critic_y, group_actor_y,
+                group_hidden, group_cell, group_next_hidden, group_next_cell]
 
     def _build_targets(self, rewards: np.ndarray, pred_values: np.ndarray, pred_next_values: np.ndarray,
                        dones: np.ndarray, gamma: float, lambda_: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -531,7 +613,6 @@ class A2C(object):
             # 1-step TD: V(s_t) r_t + \gamma V(s_{t+1}) - V(s_t)
             _next_value = rewards[t] + gamma * _next_value * (1 - dones[t])
             critic_y[t] = _next_value
-
         actor_y = critic_y - pred_values
 
         return critic_y, actor_y
@@ -546,14 +627,47 @@ class A2C(object):
 
 
 class A2CBreakout(A2C):
+    _RUNNING_ENVS = {}
 
     def create_env(self) -> gym.Env:
+        envs = [
+            'SuperMarioBros-1-1-v0',
+            'SuperMarioBros-1-2-v0',
+            'SuperMarioBros-1-3-v0',
+            'SuperMarioBros-1-4-v0',
+            'SuperMarioBros-2-1-v0',
+            'SuperMarioBros-2-3-v0',
+            'SuperMarioBros-2-4-v0',
+            'SuperMarioBros-3-1-v0',
+            'SuperMarioBros-3-2-v0',
+            'SuperMarioBros-3-3-v0',
+            'SuperMarioBros-3-4-v0',
+            'SuperMarioBros-4-1-v0',
+            'SuperMarioBros-4-2-v0',
+            'SuperMarioBros-4-3-v0',
+            'SuperMarioBros-4-4-v0',
+            'SuperMarioBros-5-1-v0',
+            'SuperMarioBros-5-2-v0',
+            'SuperMarioBros-5-3-v0',
+            'SuperMarioBros-5-4-v0',
+            'SuperMarioBros-6-1-v0',
+            'SuperMarioBros-6-2-v0',
+            'SuperMarioBros-6-3-v0',
+            'SuperMarioBros-6-4-v0',
+            'SuperMarioBros-7-1-v0',
+            'SuperMarioBros-7-3-v0',
+            'SuperMarioBros-7-4-v0',
+            'SuperMarioBros-8-1-v0',
+            'SuperMarioBros-8-2-v0',
+            'SuperMarioBros-8-3-v0',
+            'SuperMarioBros-8-4-v0',
+        ]
+
         while True:
             try:
-                world = np.random.randint(1, 9)
-                stage = np.random.randint(1, 4)
-
-                env_id = f'SuperMarioBros-{world}-{stage}-v0'
+                env_id = np.random.choice(envs)
+                if env_id in self._RUNNING_ENVS:
+                    continue
                 env = JoypadSpace(gym_super_mario_bros.make(env_id), SIMPLE_MOVEMENT)
             except UnregisteredEnv as e:
                 continue
