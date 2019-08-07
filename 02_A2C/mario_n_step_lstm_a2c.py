@@ -402,6 +402,8 @@ class A2C(object):
         return states, hidden_0, cell_0
 
     def test(self):
+        import ipdb
+        ipdb.set_trace()
         self._init_envs(1)
         agent = self.agent
 
@@ -412,11 +414,12 @@ class A2C(object):
         while True:
             action, h_state, c_state = agent.get_action(states, h_state, c_state)
 
+            self.env.render()
+
             # Interact with environments
             self.send_actions(action)
             next_states, rewards, dones, infos = self.receive_from_envs()
 
-            sleep(0.01)
 
     def train(self, gamma: float = 0.9, lambda_: float = 0.95):
         self._init_envs(self.n_processor)
@@ -624,8 +627,6 @@ class A2C(object):
             gae = gae * delta
             next_value = pred_values[t]
 
-            actor_loss
-
             gae = gamma * lambda_ * gae * (1 - dones[t]) + delta
             critic_y[t] = gae + pred_values[t]
 
@@ -672,7 +673,7 @@ def main():
     env = JoypadSpace(gym_super_mario_bros.make(env_id), SIMPLE_MOVEMENT)
     n_action = env.action_space.n
     resized_input_shape = (84, 84)
-    n_processor = 18
+    n_processor = 8
     n_history = 4
     n_step = 64
 
