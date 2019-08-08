@@ -74,26 +74,27 @@ class ActorCriticModel(nn.Module):
                       padding=1),
             nn.ReLU(),
             nn.Conv2d(in_channels=32,
-                      out_channels=32,
+                      out_channels=64,
                       kernel_size=3,
                       stride=2,
                       padding=1),
             nn.ReLU(),
-            nn.Conv2d(in_channels=32,
-                      out_channels=32,
+            nn.Conv2d(in_channels=64,
+                      out_channels=128,
                       kernel_size=3,
                       stride=2,
                       padding=1),
             nn.ReLU(),
-            nn.Conv2d(in_channels=32,
-                      out_channels=32,
+            nn.Conv2d(in_channels=128,
+                      out_channels=128,
                       kernel_size=3,
                       stride=2,
                       padding=1),
             nn.ReLU())
         # output_size = self._calculate_output_size(input_shape, n_history)
 
-        self.lstm = nn.LSTMCell(32 * 6 * 6, 512)
+        # self.lstm = nn.LSTMCell(32 * 6 * 6, 512)
+        self.lstm = nn.LSTMCell(4608, 512)
         # self.lstm = nn.LSTMCell(3456, 512)
         self.critic_linear = nn.Linear(512, 1)
         self.actor_linear = nn.Linear(512, n_action)
@@ -274,7 +275,12 @@ class SuperMarioA3C(ctx.Process):
             self.local_model.train()
 
     def initialize_game(self) -> Tuple[np.ndarray, torch.Tensor, torch.Tensor]:
-        self.env = self.create_env()
+        if self.training:
+            self.env.close()
+            self.env = self.create_env()
+        elif self.cur_episode % 1000 == 0:
+            self.env.close()
+            self.env = self.create_env()
 
         h_s = torch.zeros((1, 512), dtype=torch.float).to(self.device)
         c_s = torch.zeros((1, 512), dtype=torch.float).to(self.device)
