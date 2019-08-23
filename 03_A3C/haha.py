@@ -6,8 +6,16 @@ from nes_py.wrappers import JoypadSpace
 import gym_super_mario_bros
 from gym_super_mario_bros.actions import SIMPLE_MOVEMENT, RIGHT_ONLY, COMPLEX_MOVEMENT
 
-env = gym_super_mario_bros.make('SuperMarioBros-8-4-v0')
+# for world in range(8, 0, -1):
+#     for stage in range(1, 5):
+#         game = f'SuperMarioBros-{world}-{stage}-v0'
+#         print(game, end=' ')
+#         env = gym_super_mario_bros.make(game)
+#         env.reset()
+#         env.render()
+#         print(readchar.readchar())
 
+env = gym_super_mario_bros.make('SuperMarioBros-5-4-v0')
 env = JoypadSpace(env, SIMPLE_MOVEMENT)
 # env = gym.make('BreakoutDeterministic-v4')
 
@@ -22,9 +30,7 @@ for step in range(5000):
     action = int(readchar.readchar())
 
     state, reward, done, info = env.step(action)
-    print(state.shape)
     print(reward, done, info)
     env.render()
-
 
 env.close()

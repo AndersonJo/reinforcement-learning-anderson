@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument('--device', type=str, default='cuda', help='cuda | cpu')
     parser.add_argument('--history', type=int, default=4)
     parser.add_argument('--n-step', type=int, default=64)
-    parser.add_argument('--processor', type=int, default=8)
+    parser.add_argument('--processor', type=int, default=16)
 
     parser.add_argument('--gamma', type=float, default=0.9, help='future discounted value')
     parser.add_argument('--lambda_', type=float, default=1, help='GAE hyper parameter')
@@ -74,28 +74,26 @@ class ActorCriticModel(nn.Module):
                       padding=1),
             nn.ReLU(),
             nn.Conv2d(in_channels=32,
-                      out_channels=64,
+                      out_channels=32,
                       kernel_size=3,
                       stride=2,
                       padding=1),
             nn.ReLU(),
-            nn.Conv2d(in_channels=64,
-                      out_channels=128,
+            nn.Conv2d(in_channels=32,
+                      out_channels=32,
                       kernel_size=3,
                       stride=2,
                       padding=1),
             nn.ReLU(),
-            nn.Conv2d(in_channels=128,
-                      out_channels=128,
+            nn.Conv2d(in_channels=32,
+                      out_channels=32,
                       kernel_size=3,
                       stride=2,
                       padding=1),
             nn.ReLU())
         # output_size = self._calculate_output_size(input_shape, n_history)
 
-        # self.lstm = nn.LSTMCell(32 * 6 * 6, 512)
-        self.lstm = nn.LSTMCell(4608, 512)
-        # self.lstm = nn.LSTMCell(3456, 512)
+        self.lstm = nn.LSTMCell(32 * 6 * 6, 512)
         self.critic_linear = nn.Linear(512, 1)
         self.actor_linear = nn.Linear(512, n_action)
         self._initialize_weights()
@@ -130,12 +128,12 @@ class GlobalAdam(torch.optim.Adam):
         for group in self.param_groups:
             for p in group['params']:
                 state = self.state[p]
-                state['step'] = 0
-                state['exp_avg'] = torch.zeros_like(p.data)
-                state['exp_avg_sq'] = torch.zeros_like(p.data)
-
-                state['exp_avg'].share_memory_()
-                state['exp_avg_sq'].share_memory_()
+                # state['step'] = 0
+                # state['exp_avg'] = torch.zeros_like(p.data)
+                # state['exp_avg_sq'] = torch.zeros_like(p.data)
+                #
+                # state['exp_avg'].share_memory_()
+                # state['exp_avg_sq'].share_memory_()
 
 
 class RewardEnv(Wrapper):
@@ -143,18 +141,24 @@ class RewardEnv(Wrapper):
         super(RewardEnv, self).__init__(env)
         self.observation_space = Box(low=0, high=255, shape=(1, 84, 84))
         self.cur_score = 0
+        self.max_x_pos = 0
 
     def step(self, action: int):
         state, reward, done, info = self.env.step(action)
         state = self.preprocess_state(state)
 
-        reward += (info["score"] - self.cur_score) / 30.
+        reward += (info["score"] - self.cur_score)
         self.cur_score = info['score']
         if done:
             if info['flag_get']:
                 reward += 64
             else:
-                reward -= 64
+                if info['y_pos'] < 50:
+                    reward -= 35
+                    print('떨어짐')
+                else:
+                    reward -= 35
+
         return state, reward / 15, done, info
 
     def reset(self):
@@ -275,12 +279,12 @@ class SuperMarioA3C(ctx.Process):
             self.local_model.train()
 
     def initialize_game(self) -> Tuple[np.ndarray, torch.Tensor, torch.Tensor]:
-        if self.training:
-            self.env.close()
-            self.env = self.create_env()
-        elif self.cur_episode % 1000 == 0:
-            self.env.close()
-            self.env = self.create_env()
+        # if self.training:
+        #     self.env.close()
+        #     self.env = self.create_env()
+        # elif self.cur_episode % 1000 == 0:
+        #     self.env.close()
+        #     self.env = self.create_env()
 
         h_s = torch.zeros((1, 512), dtype=torch.float).to(self.device)
         c_s = torch.zeros((1, 512), dtype=torch.float).to(self.device)
@@ -314,10 +318,17 @@ class SuperMarioA3C(ctx.Process):
         return action, logits, policy, value, next_h, next_c
 
     def create_env(self) -> gym.Env:
-        world = np.random.randint(1, 9)
-        stage = np.random.randint(1, 5)
+        torch.manual_seed(self.idx + 100)
+        np.random.seed(self.idx + 100)
 
+        world = 1  # np.random.randint(1, 9)
+        stage = 1  # np.random.randint(1, 5)
         env_id = f'SuperMarioBros-{world}-{stage}-v0'
+        # envs = ['SuperMarioBros-1-1-v0',
+        #         'SuperMarioBros-3-3-v0']
+        #
+        # env_id = np.random.choice(envs)
+
         env = JoypadSpace(gym_super_mario_bros.make(env_id), COMPLEX_MOVEMENT)
         env = RewardEnv(env)
         env = SkipFrameEnv(env, self.n_history)
