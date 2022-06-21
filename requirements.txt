@@ -1,4 +1,4 @@
-numpy==1.17.0
+numpy==1.22.0
 gym==0.12.1
 gym-super-mario-bros==7.2.3
 nes-py==8.0.2
